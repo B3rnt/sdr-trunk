@@ -1,0 +1,32 @@
+name: Java CI with Gradle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25 with JavaFX
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'liberica'
+          java-package: 'jdk+fx'
+
+      - name: Build runtime zip
+        run: .\gradlew.bat clean runtimeZipWindows
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdrtrunk-windows
+          path: build/**/*.zip
