@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls gradlew*)",
+      "Bash(ls *.bat)",
+      "Bash(./gradlew.bat compileJava -q)",
+      "Read(//c/Program Files/Java/**)",
+      "Read(//c/Program Files/Eclipse Adoptium/**)",
+      "Read(//c/Program Files/**)"
+    ]
+  }
+}
