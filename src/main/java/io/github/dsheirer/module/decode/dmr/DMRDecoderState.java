@@ -88,6 +88,7 @@ import io.github.dsheirer.module.decode.dmr.message.data.packet.DMRPacketMessage
 import io.github.dsheirer.module.decode.dmr.message.data.packet.UDTShortMessageService;
 import io.github.dsheirer.module.decode.dmr.message.data.terminator.Terminator;
 import io.github.dsheirer.module.decode.dmr.message.type.ServiceOptions;
+import io.github.dsheirer.module.decode.dmr.message.type.TalkerAliasDataFormat;
 import io.github.dsheirer.module.decode.dmr.message.voice.VoiceEMBMessage;
 import io.github.dsheirer.module.decode.dmr.message.voice.VoiceMessage;
 import io.github.dsheirer.module.decode.dmr.message.voice.embedded.EmbeddedEncryptionParameters;
@@ -108,11 +109,6 @@ import io.github.dsheirer.module.decode.ip.mototrbo.xcmp.XCMPPacket;
 import io.github.dsheirer.protocol.Protocol;
 import io.github.dsheirer.source.tuner.channel.rotation.AddChannelRotationActiveStateRequest;
 import io.github.dsheirer.util.PacketUtil;
-import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CharsetDecoder;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import org.jdesktop.swingx.mapviewer.GeoPosition;
@@ -140,6 +136,8 @@ public class DMRDecoderState extends TimeslotDecoderState
     private CorrectedBinaryMessage mCapacityMaxTalkerAliasBlock1Fragment;
     private CorrectedBinaryMessage mCapacityMaxTalkerAliasBlock2Fragment;
     private CorrectedBinaryMessage mCapacityMaxTalkerAliasBlock3Fragment;
+    private TalkerAliasDataFormat mCapacityMaxTalkerAliasFormat = TalkerAliasDataFormat.UTF_8;
+    private int mCapacityMaxTalkerAliasCharacterCount;
 
     /**
      * Constructs an DMR decoder state with an optional traffic channel manager.
@@ -1214,6 +1212,8 @@ public class DMRDecoderState extends TimeslotDecoderState
                     mCapacityMaxTalkerAliasBlock1Fragment = null; //New header starts a fresh alias sequence
                     mCapacityMaxTalkerAliasBlock2Fragment = null;
                     mCapacityMaxTalkerAliasBlock3Fragment = null;
+                    mCapacityMaxTalkerAliasFormat = alias.getFormat();
+                    mCapacityMaxTalkerAliasCharacterCount = alias.getLength();
                     updateCapacityMaxTalkerAlias();
 
                     if(mCurrentCallEvent != null)
@@ -1489,16 +1489,18 @@ public class DMRDecoderState extends TimeslotDecoderState
         mCapacityMaxTalkerAliasBlock1Fragment = null;
         mCapacityMaxTalkerAliasBlock2Fragment = null;
         mCapacityMaxTalkerAliasBlock3Fragment = null;
+        mCapacityMaxTalkerAliasFormat = TalkerAliasDataFormat.UTF_8;
+        mCapacityMaxTalkerAliasCharacterCount = 0;
     }
 
     /**
-     * Combines the Capacity Max talker alias header fragment with the continuation fragment (if available) into a
-     * single raw byte sequence and decodes it once as UTF-8, then updates the identifier collection and traffic
-     * channel manager with the resulting talker alias.
+     * Combines the Capacity Max talker alias header fragment with any received continuation fragments into a single
+     * payload and decodes it according to the format field from the header message (BIT_7, BIT_8, UTF_8 or
+     * UNICODE_UTF_16_BE).  Mirrors the logic in TalkerAliasComplete so that multi-byte encodings such as UTF-8
+     * Cyrillic are decoded correctly regardless of where the fragment boundaries fall.
      *
-     * Note: the two fragments must be combined into a single byte sequence and decoded as a unit.  Decoding each
-     * fragment independently and concatenating the resulting strings can split a multi-byte UTF-8 character across
-     * the fragment boundary, corrupting the decoded text (e.g. truncated/garbled Cyrillic aliases).
+     * Note: fragments must be combined before decoding — splitting the byte stream at a fragment boundary and
+     * decoding each fragment individually can corrupt multi-byte characters (e.g. Cyrillic in UTF-8).
      */
     private void updateCapacityMaxTalkerAlias()
     {
@@ -1551,7 +1553,59 @@ public class DMRDecoderState extends TimeslotDecoderState
             }
         }
 
-        String value = decodeUtf8IgnoringIncompleteSequences(combined.getBytes()).trim();
+        // Decode according to the format field, mirroring TalkerAliasComplete.getAliasValue().
+        // Bit 0 of the combined payload is a reserved/padding bit per ETSI TS 102 361-2; actual character data
+        // starts at bit 1 for 8-bit-and-wider formats, and parseISO7 handles the offset internally for BIT_7.
+        int charCount = mCapacityMaxTalkerAliasCharacterCount;
+        String value = null;
+
+        mLog.debug("CapMax talker alias: format={} charCount={} hex={}", mCapacityMaxTalkerAliasFormat,
+                charCount, combined.toHexString());
+
+        try
+        {
+            switch(mCapacityMaxTalkerAliasFormat)
+            {
+                case BIT_7:
+                    if(charCount >= 1)
+                    {
+                        value = combined.parseISO7(0, charCount);
+                    }
+                    break;
+                case BIT_8:
+                    if(charCount >= 1)
+                    {
+                        value = combined.parseISO8(1, charCount);
+                    }
+                    break;
+                case UTF_8:
+                    if(charCount >= 1)
+                    {
+                        value = combined.parseUTF8(1, charCount);
+                    }
+                    break;
+                case UNICODE_UTF_16_BE:
+                    if(charCount >= 1)
+                    {
+                        value = combined.parseUnicode(1, charCount);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        catch(Exception e)
+        {
+            mLog.debug("CapMax talker alias decode error for format {}: {}", mCapacityMaxTalkerAliasFormat,
+                    e.getMessage());
+        }
+
+        if(value == null)
+        {
+            return;
+        }
+
+        value = value.trim();
 
         if(value.isEmpty())
         {
@@ -1566,31 +1620,6 @@ public class DMRDecoderState extends TimeslotDecoderState
         if(hasTrafficChannelManager() && fromRadio instanceof RadioIdentifier radio)
         {
             mTrafficChannelManager.getTalkerAliasManager().update(radio, updated);
-        }
-    }
-
-    /**
-     * Decodes the byte array as a UTF-8 string, silently discarding any malformed or incomplete trailing multi-byte
-     * sequences instead of substituting the Unicode replacement character (U+FFFD).  Capacity Max talker alias
-     * fragments are fixed-width raw byte windows that can end mid-character, so a strict/default UTF-8 decode would
-     * otherwise display a trailing replacement character (e.g. '�') to the user.
-     *
-     * @param bytes to decode
-     * @return decoded string with any trailing partial character omitted.
-     */
-    private static String decodeUtf8IgnoringIncompleteSequences(byte[] bytes)
-    {
-        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
-                .onMalformedInput(CodingErrorAction.IGNORE)
-                .onUnmappableCharacter(CodingErrorAction.IGNORE);
-
-        try
-        {
-            return decoder.decode(ByteBuffer.wrap(bytes)).toString();
-        }
-        catch(CharacterCodingException cce)
-        {
-            return "";
         }
     }
 
